@@ -20,6 +20,19 @@ from miles.utils.orchestration_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _drains_before_weight_update(args) -> bool:
+    """Whether a fully-async step drains the next batch before publishing its weights.
+
+    The buffer's staleness filter compares a group with the engine's version at the drain. A batch drained before
+    this step's update trains one version later than it was drained, so its groups are up to
+    --max-weight-staleness + 1 versions behind the weights they train with; a run that tolerates a stale version
+    takes that for a drain (buffer wait, sample conversion, DP split, store put) that overlaps training and the
+    weight update instead of sitting between them. A strictly on-policy run (bound 0 or none) keeps the drain after
+    the update.
+    """
+    return args.max_weight_staleness is not None and args.max_weight_staleness >= 1
+
+
 # The framework supports other asynchronous approaches such as fully async (see miles/rollout/fully_async_rollout.py).
 async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
     args = startup_info.args
@@ -87,6 +100,24 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
         await inference_controller.prepare_rollout(rollout_id)
         return await rollout_executor.get(rollout_id)
 
+    # The executor answers a release only when its event loop gets to it, which under a fully-async producer
+    # with thousands of streams in flight can take tens of seconds; nothing after the training step reads the
+    # released objects, so the call runs in the background and the step moves on to the weight update. One
+    # release is outstanding at most: the next step's is issued only after this one has landed.
+    pending_release: asyncio.Task | None = None
+
+    async def release_rollout(rollout_id: int) -> None:
+        await rollout_executor.release(rollout_id)
+
+    async def settle_release() -> None:
+        nonlocal pending_release
+        if pending_release is not None:
+            pending_release, task = None, pending_release
+            await task
+
+    # on every exit path the outstanding release lands before the executor's final audit and disposal
+    disposer.add(settle_release)
+
     # async train loop.
     rollout_data_next_future = await eager_create_task(prepare_and_generate(args.start_rollout_id))
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
@@ -97,9 +128,13 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
         has_next_rollout = rollout_id + 1 < args.num_rollout
         weight_update_due = (rollout_id + 1) % args.update_weights_interval == 0
 
-        # A fully-async producer keeps generating without a pending get(). When
-        # weights will change, defer the next drain so it uses the new version.
-        defer_next_drain = args.fully_async and has_next_rollout and weight_update_due
+        # A fully-async producer keeps generating without a pending get(). When weights will change, defer the
+        # next drain so it uses the new version, unless the run accepts a batch that is one version behind
+        # (--max-weight-staleness >= 1): then the drain overlaps this step and its weight update instead of
+        # following them.
+        defer_next_drain = (
+            args.fully_async and has_next_rollout and weight_update_due and not _drains_before_weight_update(args)
+        )
         if args.colocate:
             await inference_controller.pause_generation(mode=args.pause_generation_mode)
             await inference_controller.flush_cache()
@@ -123,7 +158,8 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
         else:
             await actor_model.train(rollout_id, rollout_data_curr_ref)
         remove_rollout_data_refs(args, rollout_data_curr_ref)
-        await rollout_executor.release(rollout_id)
+        await settle_release()
+        pending_release = await eager_create_task(release_rollout(rollout_id))
 
         external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
         if external_save or should_run_periodic_action(
@@ -133,6 +169,8 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
             await save_training_model(actor_model, rollout_id, force_sync)
             if args.use_critic:
                 await save_training_model(critic_model, rollout_id, force_sync)
+            # the executor's save records what it still holds: the trained rollout must be gone by then
+            await settle_release()
             await rollout_executor.save(rollout_id)
             if args.keep_recent_checkpoints is not None:
                 await asyncio.to_thread(
@@ -179,6 +217,7 @@ async def train(startup_info: OrchestratorStartupInfo, *, disposer: Disposer):
                 rollout_id,
             )
             break
+    await settle_release()
 
 
 if __name__ == "__main__":
